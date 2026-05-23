@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQS Printer Worker — Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        h1 { font-size: 1.5rem; color: #58a6ff; margin-bottom: 0.25rem; }
+        .subtitle { color: #8b949e; font-size: 0.85rem; margin-bottom: 2rem; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; max-width: 960px; }
+        @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+        .card h2 { font-size: 1rem; color: #c9d1d9; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+        .card h2::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #238636; }
+        button {
+            background: #238636;
+            color: #fff;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.15s;
+        }
+        button:hover { background: #2ea043; }
+        button:disabled { background: #484f58; cursor: not-allowed; }
+        button.danger { background: #da3633; }
+        button.danger:hover { background: #f85149; }
+        .result {
+            margin-top: 0.75rem;
+            padding: 0.75rem;
+            background: #0d1117;
+            border-radius: 6px;
+            font-family: 'Cascadia Code', 'Fira Code', monospace;
+            font-size: 0.75rem;
+            white-space: pre-wrap;
+            max-height: 240px;
+            overflow-y: auto;
+            display: none;
+        }
+        .result.visible { display: block; }
+        .result.ok { border-left: 3px solid #238636; }
+        .result.err { border-left: 3px solid #f85149; }
+        .msg-list { list-style: none; margin-top: 0.75rem; }
+        .msg-list li {
+            padding: 0.5rem 0.75rem;
+            background: #0d1117;
+            border-radius: 4px;
+            margin-bottom: 0.5rem;
+            font-size: 0.75rem;
+            font-family: 'Cascadia Code', 'Fira Code', monospace;
+            border-left: 3px solid #1f6feb;
+            word-break: break-all;
+        }
+        .empty { color: #484f58; font-style: italic; font-size: 0.8rem; }
+        .spinner {
+            display: inline-block;
+            width: 12px; height: 12px;
+            border: 2px solid #484f58;
+            border-top-color: #58a6ff;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.5rem;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .status-bar {
+            max-width: 960px; margin-bottom: 1.5rem;
+            display: flex; gap: 1rem; align-items: center;
+        }
+        .status-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background: #484f58; display: inline-block;
+        }
+        .status-dot.on { background: #238636; box-shadow: 0 0 6px #238636; }
+        .status-dot.off { background: #f85149; box-shadow: 0 0 6px #f85149; }
+        .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    </style>
+</head>
+<body>
+    <h1>SQS Printer Worker</h1>
+    <p class="subtitle">Local dashboard — <span id="clock"></span></p>
+
+    <div class="status-bar">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Verifying…</span>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h2>Test Print</h2>
+            <p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.75rem;">Send a mock receipt to the configured printer.</p>
+            <div class="actions">
+                <button id="btnTest" onclick="testPrint()">Run Test Print</button>
+            </div>
+            <pre class="result" id="testResult"></pre>
+        </div>
+
+        <div class="card">
+            <h2>Dead Letter Queue</h2>
+            <p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.75rem;">Inspect and reprocess failed messages.</p>
+            <div class="actions">
+                <button id="btnDLQ" onclick="loadDLQ()">Refresh DLQ</button>
+                <button id="btnReprocess" class="danger" onclick="reprocessDLQ()">Drain DLQ</button>
+            </div>
+            <pre class="result" id="dlqResult"></pre>
+            <ul class="msg-list" id="dlqList"></ul>
+            <p class="empty" id="dlqEmpty"></p>
+        </div>
+    </div>
+
+    <script>
+        // Live clock
+        setInterval(() => {
+            document.getElementById('clock').textContent = new Date().toLocaleString('pt-BR');
+        }, 1000);
+
+        // Health ping
+        async function checkHealth() {
+            const dot = document.getElementById('statusDot');
+            const txt = document.getElementById('statusText');
+            try {
+                const r = await fetch('/api/dlq');
+                if (r.ok) { dot.className = 'status-dot on'; txt.textContent = 'Worker running'; }
+                else { dot.className = 'status-dot off'; txt.textContent = 'Worker unreachable'; }
+            } catch { dot.className = 'status-dot off'; txt.textContent = 'Worker unreachable'; }
+        }
+        setInterval(checkHealth, 5000);
+        checkHealth();
+
+        function showResult(el, text, ok) {
+            el.textContent = text;
+            el.className = 'result visible ' + (ok ? 'ok' : 'err');
+        }
+
+        async function testPrint() {
+            const btn = document.getElementById('btnTest');
+            const el = document.getElementById('testResult');
+            btn.disabled = true;
+            el.className = 'result visible';
+            el.textContent = '';
+            try {
+                const r = await fetch('/api/test-print', { method: 'POST' });
+                const data = await r.json();
+                showResult(el, JSON.stringify(data, null, 2), r.ok);
+            } catch (e) {
+                showResult(el, 'Request failed: ' + e.message, false);
+            }
+            btn.disabled = false;
+        }
+
+        async function loadDLQ() {
+            const btn = document.getElementById('btnDLQ');
+            const list = document.getElementById('dlqList');
+            const empty = document.getElementById('dlqEmpty');
+            const el = document.getElementById('dlqResult');
+            btn.disabled = true;
+            list.innerHTML = '';
+            empty.textContent = '';
+            try {
+                const r = await fetch('/api/dlq');
+                const data = await r.json();
+                if (!r.ok) { showResult(el, JSON.stringify(data, null, 2), false); btn.disabled = false; return; }
+                el.className = 'result';
+                if (!data.messages || data.messages.length === 0) {
+                    empty.textContent = 'DLQ is empty.';
+                } else {
+                    data.messages.forEach(m => {
+                        const li = document.createElement('li');
+                        li.textContent = `[${m.id}] ${m.body}`;
+                        list.appendChild(li);
+                    });
+                }
+            } catch (e) {
+                showResult(el, 'Request failed: ' + e.message, false);
+            }
+            btn.disabled = false;
+        }
+
+        async function reprocessDLQ() {
+            const btn = document.getElementById('btnReprocess');
+            const el = document.getElementById('dlqResult');
+            btn.disabled = true;
+            el.className = 'result visible';
+            el.textContent = 'Draining DLQ…';
+            try {
+                const r = await fetch('/api/dlq/reprocess', { method: 'POST' });
+                const data = await r.json();
+                showResult(el, JSON.stringify(data, null, 2), r.ok);
+            } catch (e) {
+                showResult(el, 'Request failed: ' + e.message, false);
+            }
+            btn.disabled = false;
+        }
+    </script>
+</body>
+</html>

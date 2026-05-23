@@ -1,0 +1,14 @@
+aws:
+  region: us-east-1
+  queue_url: ""
+  dlq_url: ""
+  profile: ""
+printer:
+  name: ""
+  mode: "RAW"
+worker:
+  max_number_of_messages: 5
+  wait_time_seconds: 10
+  backoff_seconds: 15
+logging:
+  level: "INFO"
