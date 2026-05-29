@@ -38,7 +38,7 @@ type AWSConfig struct {
 
 type PrinterConfig struct {
 	Name string `yaml:"name"`
-	Mode string `yaml:"mode"`
+	Mode string `yaml:"mode"` // "RAW" or "TEXT"
 }
 
 type WorkerConfig struct {
@@ -95,6 +95,7 @@ func main() {
 	if err := initPrinter(); err != nil {
 		log.Fatalf("Failed to initialize printer: %v", err)
 	}
+	defer printerW.Close()
 
 	// Start HTTP dashboard
 	go startDashboard(ctx)
@@ -172,17 +173,21 @@ func initPrinter() error {
 	var err error
 
 	if cfg.Printer.Name != "" {
-		p, err = printer.OpenPrinter(cfg.Printer.Name)
+		p, err = printer.Open(cfg.Printer.Name)
 		if err != nil {
 			return fmt.Errorf("opening printer %q: %w", cfg.Printer.Name, err)
 		}
 	} else {
-		p, err = printer.DefaultPrinter()
+		name, err := printer.Default()
 		if err != nil {
-			return fmt.Errorf("getting default printer: %w", err)
+			return fmt.Errorf("getting default printer name: %w", err)
 		}
-		cfg.Printer.Name = p.Name
-		logf(LOG_INFO, "Using default printer: %s", p.Name)
+		p, err = printer.Open(name)
+		if err != nil {
+			return fmt.Errorf("opening default printer %q: %w", name, err)
+		}
+		cfg.Printer.Name = name
+		logf(LOG_INFO, "Using default printer: %s", name)
 	}
 	printerW = p
 	return nil
@@ -191,10 +196,27 @@ func initPrinter() error {
 // ---------- Printer logic ----------
 
 func printText(body string) error {
-	if cfg.Printer.Mode == "RAW" {
-		return printerW.Raw(body)
+	mode := "TEXT"
+	if strings.ToUpper(cfg.Printer.Mode) == "RAW" {
+		mode = "RAW"
 	}
-	return printerW.Text(body)
+
+	if err := printerW.StartDocument("Order Print Job", mode); err != nil {
+		return fmt.Errorf("failed to start document: %w", err)
+	}
+	defer printerW.EndDocument()
+
+	if err := printerW.StartPage(); err != nil {
+		return fmt.Errorf("failed to start page: %w", err)
+	}
+	defer printerW.EndPage()
+
+	_, err := printerW.Write([]byte(body))
+	if err != nil {
+		return fmt.Errorf("failed writing to print pool: %w", err)
+	}
+
+	return nil
 }
 
 // ---------- SQS Worker ----------
@@ -217,7 +239,6 @@ func runWorker(ctx context.Context) {
 		})
 
 		if err != nil {
-			// AWS down or no internet — apply backoff before retrying
 			logf(LOG_ERROR, "ReceiveMessage error: %v (backing off %ds)", err, cfg.Worker.BackoffSeconds)
 			sleepCtx(ctx, time.Duration(cfg.Worker.BackoffSeconds)*time.Second)
 			continue
@@ -231,10 +252,8 @@ func runWorker(ctx context.Context) {
 			if err := printText(*msg.Body); err != nil {
 				logf(LOG_ERROR, "Print failed for message %s — routing to DLQ: %v", *msg.MessageId, err)
 
-				// Route failed message to the Dead Letter Queue
 				if _, sendErr := sqsClient.SendMessage(ctx, &sqs.SendMessageInput{
-					QueueUrl: &cfg.AWS.DLQURL,
-					// Preserve original message body and attach the original MessageId for traceability
+					QueueUrl:               &cfg.AWS.DLQURL,
 					MessageBody:            msg.Body,
 					MessageDeduplicationId: msg.MessageId,
 				}); sendErr != nil {
@@ -243,8 +262,6 @@ func runWorker(ctx context.Context) {
 					logf(LOG_INFO, "Message %s sent to DLQ", *msg.MessageId)
 				}
 
-				// Delete the original message from the main queue regardless of DLQ send success,
-				// to prevent infinite reprocessing of an unprintable message.
 				deleteFromMainQueue(ctx, &msg)
 			} else {
 				logf(LOG_INFO, "Successfully printed message %s", *msg.MessageId)
@@ -290,13 +307,10 @@ func drainDLQ(ctx context.Context) {
 
 		for _, msg := range resp.Messages {
 			if err := printText(*msg.Body); err != nil {
-				// On DLQ print failure, abort drain immediately.
-				// The message stays in the DLQ and the system proceeds to the main queue loop.
 				logf(LOG_ERROR, "DLQ print failed for message %s — aborting drain: %v", *msg.MessageId, err)
 				return
 			}
 
-			// Delete the successfully printed message from the DLQ
 			if _, err := sqsClient.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 				QueueUrl:      &cfg.AWS.DLQURL,
 				ReceiptHandle: msg.ReceiptHandle,
@@ -316,7 +330,7 @@ func drainDLQ(ctx context.Context) {
 
 type dashboardHandler struct {
 	drainMu sync.Mutex
-	drainCh chan struct{} // signals the handler to wait for drain completion
+	drainCh chan struct{}
 	drainWg sync.WaitGroup
 }
 
@@ -327,16 +341,9 @@ var dashHandler = &dashboardHandler{
 func startDashboard(ctx context.Context) {
 	mux := http.NewServeMux()
 
-	// Serve the static HTML dashboard
 	mux.Handle("/", http.FileServer(http.Dir(".")))
-
-	// POST /api/test-print — mock print for diagnostics
 	mux.HandleFunc("/api/test-print", handleTestPrint)
-
-	// GET /api/dlq — peek DLQ messages without deleting
 	mux.HandleFunc("/api/dlq", handleDLQPeek)
-
-	// POST /api/dlq/reprocess — trigger DLQ drain on demand
 	mux.HandleFunc("/api/dlq/reprocess", handleDLQReprocess)
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}
@@ -389,9 +396,7 @@ func handleDLQPeek(w http.ResponseWriter, r *http.Request) {
 	resp, err := sqsClient.ReceiveMessage(r.Context(), &sqs.ReceiveMessageInput{
 		QueueUrl:            &cfg.AWS.DLQURL,
 		MaxNumberOfMessages: 10,
-		// Short visibility timeout so messages become available again quickly.
-		// This is a peek — we do NOT delete them.
-		VisibilityTimeout: 2,
+		VisibilityTimeout:   2,
 	})
 	if err != nil {
 		jsonResp(w, http.StatusInternalServerError, map[string]string{
@@ -401,8 +406,6 @@ func handleDLQPeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Change the visibility timeout back to 0 so messages are immediately available
-	// (the default visibility timeout would otherwise hide them for 30s).
 	for _, msg := range resp.Messages {
 		sqsClient.ChangeMessageVisibility(r.Context(), &sqs.ChangeMessageVisibilityInput{
 			QueueUrl:          &cfg.AWS.DLQURL,
@@ -438,7 +441,6 @@ func handleDLQReprocess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prevent concurrent drain operations
 	if !dashHandler.drainMu.TryLock() {
 		jsonResp(w, http.StatusConflict, map[string]string{
 			"status": "error",
